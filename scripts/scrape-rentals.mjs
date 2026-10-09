@@ -1,3 +1,4 @@
+import { load } from "cheerio";
 import fs from "fs/promises";
 
 const SOURCE_URL =
@@ -9,13 +10,7 @@ await fs.mkdir(OUTPUT_DIR, { recursive: true });
 
 function clean(value = "") {
   return String(value)
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&#038;/gi, "&")
-    .replace(/&#8211;/g, "–")
-    .replace(/&#8217;/g, "'")
-    .replace(/&quot;/gi, '"')
-    .replace(/<[^>]+>/g, " ")
+    .replace(/\u00a0/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -35,6 +30,35 @@ function absoluteUrl(href) {
   } catch {
     return "";
   }
+}
+
+function isPropertyUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname.replace(/\/+$/, "");
+
+    if (parsed.hostname !== "app.rentsmart.com") {
+      return false;
+    }
+
+    if (!path.startsWith("/phd-property-management/")) {
+      return false;
+    }
+
+    return (
+      path.replace("/phd-property-management/", "").length > 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+function getNumber(text, regex) {
+  const match = text.match(regex);
+
+  if (!match) return null;
+
+  return Number(match[1].replace(/,/g, ""));
 }
 
 console.log("Downloading RentSmart listings...");
@@ -65,163 +89,170 @@ if (/confirm you are human|not a robot/i.test(html)) {
 
 console.log(`Downloaded ${html.length} characters.`);
 
-/*
- * Convert enough HTML structure to line breaks that the
- * listing-card text is easier to analyze.
- */
-const readable = html
-  .replace(/<br\s*\/?>/gi, "\n")
-  .replace(/<\/(?:div|p|li|h1|h2|h3|h4|section|article)>/gi, "\n");
+const $ = load(html);
 
-const text = clean(
-  readable.replace(/\n+/g, " \n ")
-);
+const propertyLinks = [];
 
-/*
- * Locate property addresses appearing in the page.
- */
-const addressRegex =
-  /\b(\d{1,6}\s+[A-Za-z0-9 .,'#-]+?\s(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Lane|Ln|Court|Ct|Way|Boulevard|Blvd|Circle|Cir|Place|Pl|Highway|Hwy|Trail|Trl|Terrace|Ter|Parkway|Pkwy)(?:,\s*(?:Unit|Apt|#)\s*[A-Za-z0-9-]+)?)\s+([A-Za-z .'-]+,\s*SC,?\s*\d{5})/gi;
+$("a[href]").each((_, element) => {
+  const href = absoluteUrl($(element).attr("href"));
 
-const addressMatches = [...text.matchAll(addressRegex)];
+  if (isPropertyUrl(href)) {
+    propertyLinks.push({
+      element,
+      url: href.replace(/\/+$/, ""),
+    });
+  }
+});
 
 console.log(
-  `Found ${addressMatches.length} address occurrences.`
+  `Found ${propertyLinks.length} property-link occurrences.`
 );
 
 const rentals = [];
+const processedUrls = new Set();
 
-for (const match of addressMatches) {
-  const street = clean(match[1]);
-  const cityStateZip = clean(match[2]);
-
-  /*
-   * Get the surrounding listing-card text so we can extract
-   * rent, beds, baths, and square footage.
-   */
-  const index = match.index ?? 0;
-  const nearby = text.slice(
-    Math.max(0, index - 1000),
-    Math.min(text.length, index + 700)
-  );
-
-  const rentMatch = nearby.match(
-    /\$([\d,]+(?:\.\d{2})?)\s*(?:\/\s*)?(?:mo|month)\b/i
-  );
-
-  const bedMatch = nearby.match(
-    /(\d+(?:\.\d+)?)\s*bed\b/i
-  );
-
-  const bathMatch = nearby.match(
-    /(\d+(?:\.\d+)?)\s*bath\b/i
-  );
-
-  const sqftMatch = nearby.match(
-    /([\d,]+)\s*(?:sqft|sq\.?\s*ft\.?|square feet)\b/i
-  );
-
-  if (!rentMatch) {
+for (const item of propertyLinks) {
+  if (processedUrls.has(item.url)) {
     continue;
   }
 
-  /*
-   * Find links near this property's address in the original HTML.
-   * Prefer an individual RentSmart property URL.
-   */
-  const escapedStreet = street
-    .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-    .split(/\s+/)
-    .slice(0, 3)
-    .join("[\\s\\S]{0,100}");
-
-  const propertyAreaRegex = new RegExp(
-    `[\\s\\S]{0,2500}${escapedStreet}[\\s\\S]{0,2500}`,
-    "i"
-  );
-
-  const propertyArea =
-    html.match(propertyAreaRegex)?.[0] || "";
-
-  const hrefs = [
-    ...propertyArea.matchAll(
-      /href=["']([^"']+)["']/gi
-    ),
-  ]
-    .map((m) => absoluteUrl(m[1]))
-    .filter(Boolean);
-
-  let listingUrl =
-    hrefs.find((url) => {
-      try {
-        const u = new URL(url);
-
-        return (
-          u.hostname === "app.rentsmart.com" &&
-          u.pathname.startsWith(
-            "/phd-property-management/"
-          ) &&
-          u.pathname.replace(
-            "/phd-property-management/",
-            ""
-          ).length > 0
-        );
-      } catch {
-        return false;
-      }
-    }) || "";
+  let node = $(item.element);
+  let cardText = "";
 
   /*
-   * Do NOT invent an individual URL if RentSmart does not
-   * publish one in the page.
+   * Walk upward from the property's link until we find
+   * the individual card containing price, beds, baths,
+   * square footage, and address.
    */
-  if (!listingUrl) {
-    listingUrl = SOURCE_URL;
+  for (let level = 0; level < 10; level++) {
+    const text = clean(node.text());
+
+    const hasRent =
+      /\$[\d,]+(?:\.\d{2})?\s*\/?\s*mo\b/i.test(text);
+
+    const hasBeds =
+      /\d+(?:\.\d+)?\s*bed\b/i.test(text);
+
+    const hasBaths =
+      /\d+(?:\.\d+)?\s*bath\b/i.test(text);
+
+    const hasSqft =
+      /[\d,]+\s*sqft\b/i.test(text);
+
+    const hasSC =
+      /,\s*SC,?\s*\d{5}\b/i.test(text);
+
+    if (
+      hasRent &&
+      hasBeds &&
+      hasBaths &&
+      hasSqft &&
+      hasSC
+    ) {
+      cardText = text;
+      break;
+    }
+
+    node = node.parent();
+
+    if (!node.length) break;
   }
 
+  if (!cardText) {
+    continue;
+  }
+
+  const rent = getNumber(
+    cardText,
+    /\$([\d,]+(?:\.\d{2})?)\s*\/?\s*mo\b/i
+  );
+
+  const bedrooms = getNumber(
+    cardText,
+    /(\d+(?:\.\d+)?)\s*bed\b/i
+  );
+
+  const bathrooms = getNumber(
+    cardText,
+    /(\d+(?:\.\d+)?)\s*bath\b/i
+  );
+
+  const squareFeet = getNumber(
+    cardText,
+    /([\d,]+)\s*sqft\b/i
+  );
+
+  /*
+   * The address follows the sqft value on RentSmart's
+   * cards. Parsing only that tail prevents one card's
+   * data from bleeding into another.
+   */
+  const sqftMatch = cardText.match(
+    /[\d,]+\s*sqft\b/i
+  );
+
+  if (!sqftMatch) continue;
+
+  const sqftEnd =
+    sqftMatch.index + sqftMatch[0].length;
+
+  const addressArea = cardText.slice(sqftEnd);
+
+  const addressMatch = addressArea.match(
+    /([1-9]\d{0,5}\s+.{1,80}?\b(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Lane|Ln|Court|Ct|Way|Boulevard|Blvd|Circle|Cir|Place|Pl|Highway|Hwy|Trail|Trl|Terrace|Ter|Parkway|Pkwy)\b(?:,\s*(?:Unit|Apt|#)\s*[A-Za-z0-9-]+)?(?:\s*[-–—]\s*[A-Za-z0-9 ]+?)?)\s+([A-Za-z][A-Za-z .'-]+,\s*SC,?\s*\d{5})\b/i
+  );
+
+  if (!addressMatch) {
+    console.log(
+      `Could not parse address for ${item.url}`
+    );
+    console.log(`Card: ${cardText}`);
+    continue;
+  }
+
+  const street = clean(addressMatch[1]);
+  const cityStateZip = clean(addressMatch[2])
+    .replace(/,\s*SC\s+/i, ", SC, ");
+
+  const address = `${street}, ${cityStateZip}`;
+
   const rental = {
-    address: `${street}, ${cityStateZip}`,
-    street,
-    city_state_zip: cityStateZip,
-    rent: Number(
-      rentMatch[1].replace(/,/g, "")
-    ),
-    bedrooms: bedMatch
-      ? Number(bedMatch[1])
-      : null,
-    bathrooms: bathMatch
-      ? Number(bathMatch[1])
-      : null,
-    square_feet: sqftMatch
-      ? Number(
-          sqftMatch[1].replace(/,/g, "")
-        )
-      : null,
-    listing_url: listingUrl,
+    address,
+    rent,
+    bedrooms,
+    bathrooms,
+    square_feet: squareFeet,
+    listing_url: item.url,
   };
 
   /*
-   * Prevent duplicate matches for the same address.
+   * Safety checks. Bad data should stop the automation
+   * instead of being published to Allo.
    */
   if (
-    !rentals.some(
-      (existing) =>
-        existing.address.toLowerCase() ===
-        rental.address.toLowerCase()
-    )
+    rent === null ||
+    bedrooms === null ||
+    bathrooms === null ||
+    squareFeet === null
   ) {
-    rentals.push(rental);
+    throw new Error(
+      `Missing listing data for ${address}`
+    );
   }
+
+  if (/\b(?:bed|bath|sqft)\b/i.test(address)) {
+    throw new Error(
+      `Invalid address detected: ${address}`
+    );
+  }
+
+  rentals.push(rental);
+  processedUrls.add(item.url);
 }
 
 if (rentals.length === 0) {
-  await fs.writeFile(
-    "rentsmart-debug.html",
-    html
-  );
-
   throw new Error(
-    "The RentSmart page loaded, but no rental listings could be parsed."
+    "No current rental listings could be parsed."
   );
 }
 
@@ -235,7 +266,17 @@ console.log(
 
 for (const rental of rentals) {
   console.log(
-    `- ${rental.address} | $${rental.rent}/mo | ${rental.listing_url}`
+    `- ${rental.address} | $${rental.rent}/mo | ${rental.bedrooms} bed | ${rental.bathrooms} bath | ${rental.square_feet} sqft | ${rental.listing_url}`
+  );
+}
+
+const urls = rentals.map(
+  (rental) => rental.listing_url
+);
+
+if (new Set(urls).size !== urls.length) {
+  throw new Error(
+    "Duplicate property URLs detected. Refusing to publish."
   );
 }
 
@@ -248,60 +289,54 @@ const updatedAt = new Intl.DateTimeFormat(
   }
 ).format(new Date());
 
-const propertySections = rentals
+const sections = rentals
   .map(
     (rental) => `
 <section>
   <h2>${escapeHtml(rental.address)}</h2>
 
-  <p><strong>Status:</strong> Currently listed for rent</p>
+  <p><strong>Status:</strong> Available for rent</p>
 
   <p>
     <strong>Monthly Rent:</strong>
     $${rental.rent.toLocaleString("en-US")}
   </p>
 
-  ${
-    rental.bedrooms !== null
-      ? `<p><strong>Bedrooms:</strong> ${rental.bedrooms}</p>`
-      : ""
-  }
+  <p>
+    <strong>Bedrooms:</strong>
+    ${rental.bedrooms}
+  </p>
 
-  ${
-    rental.bathrooms !== null
-      ? `<p><strong>Bathrooms:</strong> ${rental.bathrooms}</p>`
-      : ""
-  }
+  <p>
+    <strong>Bathrooms:</strong>
+    ${rental.bathrooms}
+  </p>
 
-  ${
-    rental.square_feet !== null
-      ? `<p><strong>Square Feet:</strong> ${rental.square_feet.toLocaleString(
-          "en-US"
-        )}</p>`
-      : ""
-  }
+  <p>
+    <strong>Square Feet:</strong>
+    ${rental.square_feet.toLocaleString("en-US")}
+  </p>
 
   <p>
     <strong>RentSmart Listing:</strong>
-    <a href="${escapeHtml(
-      rental.listing_url
-    )}">
+    <a href="${escapeHtml(rental.listing_url)}">
       ${escapeHtml(rental.listing_url)}
     </a>
   </p>
 
   <p>
-    Use the RentSmart listing for current photos,
-    additional details, application information, and
-    available showing or self-showing options.
+    Use the RentSmart property page for photos,
+    additional details, application information,
+    and available showing or self-showing options.
   </p>
 </section>
+
 <hr>
 `
   )
   .join("\n");
 
-const outputHtml = `<!doctype html>
+const output = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -309,7 +344,7 @@ const outputHtml = `<!doctype html>
     name="viewport"
     content="width=device-width, initial-scale=1"
   >
-  <title>PHD Properties Current Rentals</title>
+  <title>PHD Properties Current Rental Listings</title>
 </head>
 
 <body>
@@ -327,18 +362,18 @@ const outputHtml = `<!doctype html>
     </p>
 
     <p>
-      This page is automatically generated from the
-      current PHD Property Management RentSmart listings.
+      Automatically generated from the current
+      PHD Property Management RentSmart listings.
     </p>
 
-    ${propertySections}
+    ${sections}
 
     <h2>AI Receptionist Instructions</h2>
 
     <p>
-      Use this page as the current source of truth for
+      Use this page as the source of truth for current
       rental availability, rent, bedrooms, bathrooms,
-      square footage, and approved RentSmart listing links.
+      square footage, and RentSmart listing links.
     </p>
 
     <p>
@@ -347,17 +382,15 @@ const outputHtml = `<!doctype html>
 
     <p>
       Minor speech-recognition differences may be matched
-      when there is only one clear current property match.
+      when there is only one clear current listing.
       For example, "115 Catherine Drive" may mean
       "115 Kathryn Drive."
     </p>
 
     <p>
       For normal rental inquiries, answer the caller's
-      question and offer to text the RentSmart listing link.
-      Transfer to Property Management only when the caller
-      needs help beyond normal listing information or
-      explicitly requests Property Management.
+      question and offer to text the exact RentSmart
+      property link.
     </p>
   </main>
 </body>
@@ -365,7 +398,7 @@ const outputHtml = `<!doctype html>
 
 await fs.writeFile(
   `${OUTPUT_DIR}/index.html`,
-  outputHtml
+  output
 );
 
 await fs.writeFile(
