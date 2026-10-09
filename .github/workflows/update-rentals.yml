@@ -31,7 +31,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 24
-
+          
+      - name: Install HTML parser
+        run: npm install --no-save cheerio@1
+        
       - name: Scrape current RentSmart listings
         run: node scripts/scrape-rentals.mjs
 
