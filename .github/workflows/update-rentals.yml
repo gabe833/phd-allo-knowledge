@@ -39,8 +39,8 @@ jobs:
           npm install --no-save playwright
           npx playwright install --with-deps chromium
 
-      - name: Scrape current RentSmart listings
-        run: node scripts/scrape-rentals.mjs
+- name: Test RentSmart HTML
+  run: node scripts/test-rentsmart.mjs
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
